@@ -7,7 +7,6 @@ Scripts are compatible with macOS, Linux and WSL, Windows is not supported.
 ## Build Dependencies
 
 - git
-- curl
 - make
 - python3
 - pkg-conf

@@ -1,0 +1,500 @@
+diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
+index cf1177a..ed4b700 100644
+--- a/libavcodec/ohdec.c
++++ b/libavcodec/ohdec.c
+@@ -23,12 +23,15 @@
+ #include <stdbool.h>
+ #include <multimedia/player_framework/native_avcapability.h>
+ #include <multimedia/player_framework/native_avcodec_videodecoder.h>
++#include <native_buffer/native_buffer.h>
+ 
+ #include "libavutil/fifo.h"
++#include "libavutil/hwcontext.h"
+ #include "libavutil/hwcontext_oh.h"
+ #include "libavutil/imgutils.h"
+ #include "libavutil/mem.h"
+ #include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
+ #include "libavutil/thread.h"
+ 
+ #include "avcodec.h"
+@@ -60,6 +63,7 @@ typedef struct OHCodecDecContext {
+     bool eof_sent;
+ 
+     bool output_to_window;
++    bool output_hw_frame;
+     bool got_stream_info;
+     int width;
+     int height;
+@@ -75,8 +79,71 @@ typedef struct OHCodecBuffer {
+     uint32_t index;
+     OH_AVBuffer *buffer;
+     AVBufferRef *dec_ref;
++    AVBufferRef *device_ref;
++    uint64_t generation;
++    bool render;
++    AVOHCodecFrameDescriptor desc;
+ } OHCodecBuffer;
+ 
++static enum AVPixelFormat oh_sw_format_from_native_format(OH_NativeBuffer_Format format)
++{
++    switch (format) {
++    case NATIVEBUFFER_PIXEL_FMT_YCBCR_P010:
++    case NATIVEBUFFER_PIXEL_FMT_YCRCB_P010:
++        return AV_PIX_FMT_P010;
++    case NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP:
++        return AV_PIX_FMT_NV12;
++    case NATIVEBUFFER_PIXEL_FMT_YCRCB_420_SP:
++        return AV_PIX_FMT_NV21;
++    default:
++        return AV_PIX_FMT_NONE;
++    }
++}
++
++static enum AVPixelFormat oh_decode_resolve_sw_format(AVCodecContext *avctx,
++                                                      OH_AVBuffer *buffer,
++                                                      OH_NativeBuffer_Format *native_format_out)
++{
++    OH_NativeBuffer *native_buffer = OH_AVBuffer_GetNativeBuffer(buffer);
++    if (!native_buffer)
++        return avctx->sw_pix_fmt;
++
++    OH_NativeBuffer_Config config = {0};
++    OH_NativeBuffer_GetConfig(native_buffer, &config);
++    OH_NativeBuffer_Unreference(native_buffer);
++
++    if (native_format_out)
++        *native_format_out = config.format;
++
++    enum AVPixelFormat sw_format = oh_sw_format_from_native_format(config.format);
++    return sw_format == AV_PIX_FMT_NONE ? avctx->sw_pix_fmt : sw_format;
++}
++
++static AVOHCodecDeviceContext *oh_decode_device_hwctx(AVCodecContext *avctx)
++{
++    if (!avctx->hw_device_ctx)
++        return NULL;
++
++    AVHWDeviceContext *device_ctx = (AVHWDeviceContext *)avctx->hw_device_ctx->data;
++    if (!device_ctx || device_ctx->type != AV_HWDEVICE_TYPE_OHCODEC)
++        return NULL;
++
++    return device_ctx->hwctx;
++}
++
++static uint64_t oh_decode_output_generation(AVCodecContext *avctx)
++{
++    AVOHCodecDeviceContext *dev = oh_decode_device_hwctx(avctx);
++    return dev ? dev->output_generation : 0;
++}
++
++static void oh_decode_invalidate_outputs(AVCodecContext *avctx)
++{
++    AVOHCodecDeviceContext *dev = oh_decode_device_hwctx(avctx);
++    if (dev)
++        dev->output_generation++;
++}
++
+ static void oh_decode_release(void *opaque, uint8_t *data)
+ {
+     OH_AVCodec *dec = (OH_AVCodec *)data;
+@@ -130,17 +197,72 @@ static int oh_decode_create(OHCodecDecContext *s, AVCodecContext *avctx)
+     return 0;
+ }
+ 
++static int oh_decode_init_hwframes(OHCodecDecContext *s, AVCodecContext *avctx,
++                                   enum AVPixelFormat sw_format)
++{
++    AVHWFramesContext *frames_ctx;
++    int ret;
++
++    if (!s->output_hw_frame)
++        return 0;
++    if (!avctx->hw_device_ctx)
++        return AVERROR(EINVAL);
++
++    if (avctx->hw_frames_ctx) {
++        frames_ctx = (AVHWFramesContext *)avctx->hw_frames_ctx->data;
++        if (frames_ctx->format == AV_PIX_FMT_OHCODEC &&
++            frames_ctx->sw_format == sw_format &&
++            frames_ctx->width == s->width &&
++            frames_ctx->height == s->height)
++            return 0;
++        av_buffer_unref(&avctx->hw_frames_ctx);
++    }
++
++    avctx->hw_frames_ctx = av_hwframe_ctx_alloc(avctx->hw_device_ctx);
++    if (!avctx->hw_frames_ctx)
++        return AVERROR(ENOMEM);
++
++    frames_ctx = (AVHWFramesContext *)avctx->hw_frames_ctx->data;
++    frames_ctx->format = AV_PIX_FMT_OHCODEC;
++    frames_ctx->sw_format = sw_format;
++    frames_ctx->width = s->width;
++    frames_ctx->height = s->height;
++
++    ret = av_hwframe_ctx_init(avctx->hw_frames_ctx);
++    if (ret < 0)
++        av_buffer_unref(&avctx->hw_frames_ctx);
++
++    return ret;
++}
++
+ static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx)
+ {
+     int ret;
+     OHNativeWindow *window = NULL;
++    AVOHCodecOutputMode output_mode = AV_OHCODEC_OUTPUT_MODE_AUTO;
+ 
+     if (avctx->hw_device_ctx) {
+         AVHWDeviceContext *device_ctx = (AVHWDeviceContext*)(avctx->hw_device_ctx->data);
+         if (device_ctx->type == AV_HWDEVICE_TYPE_OHCODEC) {
+             AVOHCodecDeviceContext *dev = device_ctx->hwctx;
+-            window = dev->native_window;
+-            s->output_to_window = true;
++            output_mode = dev->output_mode;
++            if (output_mode == AV_OHCODEC_OUTPUT_MODE_AUTO)
++                output_mode = dev->native_window
++                    ? AV_OHCODEC_OUTPUT_MODE_SURFACE
++                    : AV_OHCODEC_OUTPUT_MODE_BUFFER;
++
++            if (output_mode == AV_OHCODEC_OUTPUT_MODE_SURFACE) {
++                window = dev->native_window;
++                if (!window) {
++                    av_log(avctx, AV_LOG_ERROR,
++                           "Surface output mode requires a native window\n");
++                    return AVERROR(EINVAL);
++                }
++                s->output_to_window = true;
++                s->output_hw_frame = true;
++            } else if (output_mode == AV_OHCODEC_OUTPUT_MODE_BUFFER) {
++                s->output_hw_frame = true;
++            }
+         } else {
+             av_log(avctx, AV_LOG_WARNING, "Ignore invalid hw device type %s\n",
+                    av_hwdevice_get_type_name(device_ctx->type));
+@@ -233,21 +355,30 @@ static void oh_decode_on_stream_changed(OH_AVCodec *codec, OH_AVFormat *format,
+     }
+ 
+     if (OH_AVFormat_GetIntValue(format, OH_MD_KEY_PIXEL_FORMAT, &n)) {
++        int ret;
++        enum AVPixelFormat sw_format;
++
+         s->pix_fmt = n;
+-        /* When use output_to_window, the returned format is the memory
+-         * layout of hardware frame, not AV_PIXEL_FORMAT_SURFACE_FORMAT as
+-         * expected.
+-         */
+-        if (s->output_to_window)
+-            avctx->pix_fmt = AV_PIX_FMT_OHCODEC;
+-        else
+-            avctx->pix_fmt = ff_oh_pix_to_ff_pix(s->pix_fmt);
+-        // Check whether this pixel format is supported
+-        if (avctx->pix_fmt == AV_PIX_FMT_NONE) {
++        sw_format = ff_oh_pix_to_ff_pix(s->pix_fmt);
++        if (sw_format == AV_PIX_FMT_NONE) {
+             av_log(avctx, AV_LOG_ERROR, "Unsupported OH_AVPixelFormat %d\n",
+                    n);
+             goto out;
+         }
++
++        avctx->sw_pix_fmt = sw_format;
++        if (s->output_hw_frame) {
++            avctx->pix_fmt = AV_PIX_FMT_OHCODEC;
++            ret = oh_decode_init_hwframes(s, avctx, sw_format);
++            if (ret < 0) {
++                av_log(avctx, AV_LOG_ERROR,
++                       "Failed to initialize OHCodec hw frames context: %s\n",
++                       av_err2str(ret));
++                goto out;
++            }
++        } else {
++            avctx->pix_fmt = sw_format;
++        }
+     } else {
+         av_log(avctx, AV_LOG_ERROR, "Failed to get pixel format\n");
+         goto out;
+@@ -395,8 +526,9 @@ static av_cold int oh_decode_close(AVCodecContext *avctx)
+     OHCodecDecContext *s = avctx->priv_data;
+ 
+     if (s->dec) {
+-        /* Stop but don't destroy dec directly, to keep hardware frames on
+-         * the fly valid.
++        oh_decode_invalidate_outputs(avctx);
++        /* Stop but don't destroy dec directly: outstanding frames still own a
++         * decoder reference, but their buffer-mode outputs are invalidated.
+          */
+         OH_AVErrCode err = OH_VideoDecoder_Stop(s->dec);
+         if (err == AV_ERR_OK)
+@@ -427,22 +559,37 @@ static void oh_buffer_release(void *opaque, uint8_t *data)
+         return;
+ 
+     OHCodecBuffer *buffer = opaque;
++    bool stale = false;
++
++    if (buffer->device_ref) {
++        AVHWDeviceContext *device_ctx = (AVHWDeviceContext *)buffer->device_ref->data;
++        if (device_ctx && device_ctx->type == AV_HWDEVICE_TYPE_OHCODEC) {
++            AVOHCodecDeviceContext *dev = device_ctx->hwctx;
++            stale = dev && buffer->generation != dev->output_generation;
++        }
++    }
+ 
+     if (!buffer->dec_ref) {
++        av_buffer_unref(&buffer->device_ref);
+         av_free(buffer);
+         return;
+     }
+ 
+-    if (buffer->buffer) {
++    if (buffer->buffer && !stale) {
+         OH_AVCodec *dec = (OH_AVCodec *)buffer->dec_ref->data;
+-        OH_AVCodecBufferAttr attr;
+-        OH_AVErrCode err = OH_AVBuffer_GetBufferAttr(buffer->buffer, &attr);
+-        if (err == AV_ERR_OK && !(attr.flags & AVCODEC_BUFFER_FLAGS_DISCARD))
+-            OH_VideoDecoder_RenderOutputBuffer(dec, buffer->index);
+-        else
++        if (buffer->render) {
++            OH_AVCodecBufferAttr attr;
++            OH_AVErrCode err = OH_AVBuffer_GetBufferAttr(buffer->buffer, &attr);
++            if (err == AV_ERR_OK && !(attr.flags & AVCODEC_BUFFER_FLAGS_DISCARD))
++                OH_VideoDecoder_RenderOutputBuffer(dec, buffer->index);
++            else
++                OH_VideoDecoder_FreeOutputBuffer(dec, buffer->index);
++        } else {
+             OH_VideoDecoder_FreeOutputBuffer(dec, buffer->index);
++        }
+     }
+ 
++    av_buffer_unref(&buffer->device_ref);
+     av_buffer_unref(&buffer->dec_ref);
+     av_free(buffer);
+ }
+@@ -452,10 +599,30 @@ static int oh_decode_wrap_hw_buffer(AVCodecContext *avctx, AVFrame *frame,
+                                     const OH_AVCodecBufferAttr *attr)
+ {
+     OHCodecDecContext *s = avctx->priv_data;
++    OH_NativeBuffer_Format native_format = NATIVEBUFFER_PIXEL_FMT_BUTT;
++    enum AVPixelFormat sw_format =
++        oh_decode_resolve_sw_format(avctx, output->buffer, &native_format);
++    uint8_t *data[4] = {0};
++    int linesize[4] = {0};
++    int ret;
++
++    if (sw_format != avctx->sw_pix_fmt) {
++        avctx->sw_pix_fmt = sw_format;
++        ret = oh_decode_init_hwframes(s, avctx, sw_format);
++        if (ret < 0) {
++            av_log(avctx, AV_LOG_ERROR,
++                   "Failed to update OHCodec hw frames context for native format %d: %s\n",
++                   native_format, av_err2str(ret));
++            return ret;
++        }
++        av_log(avctx, AV_LOG_DEBUG,
++               "Resolved OHCodec native buffer format %d to %s\n",
++               native_format, av_get_pix_fmt_name(sw_format));
++    }
+ 
+     frame->width = s->width;
+     frame->height = s->height;
+-    int ret = ff_decode_frame_props(avctx, frame);
++    ret = ff_decode_frame_props(avctx, frame);
+     if (ret < 0)
+         return ret;
+ 
+@@ -470,21 +637,78 @@ static int oh_decode_wrap_hw_buffer(AVCodecContext *avctx, AVFrame *frame,
+         return AVERROR(ENOMEM);
+     }
+ 
++    if (avctx->hw_device_ctx) {
++        buffer->device_ref = av_buffer_ref(avctx->hw_device_ctx);
++        if (!buffer->device_ref) {
++            oh_buffer_release(buffer, NULL);
++            return AVERROR(ENOMEM);
++        }
++    }
++
+     buffer->index = output->index;
+     buffer->buffer = output->buffer;
+-    frame->buf[0] = av_buffer_create((uint8_t *)buffer->buffer, 1,
++    buffer->render = s->output_to_window;
++    buffer->generation = oh_decode_output_generation(avctx);
++    buffer->desc = (AVOHCodecFrameDescriptor) {
++        .buffer = output->buffer,
++        .index = output->index,
++        .width = s->width,
++        .height = s->height,
++        .stride = s->stride,
++        .slice_height = s->slice_height,
++        .pixel_format = s->pix_fmt,
++        .native_buffer_format = native_format,
++        .generation = buffer->generation,
++    };
++    frame->buf[0] = av_buffer_create((uint8_t *)&buffer->desc, sizeof(buffer->desc),
+                                      oh_buffer_release,
+                                      buffer, AV_BUFFER_FLAG_READONLY);
+     if (!frame->buf[0]) {
+         oh_buffer_release(buffer, NULL);
+         return AVERROR(ENOMEM);
+     }
+-    // Point to OH_AVBuffer
++
++    if (avctx->hw_frames_ctx) {
++        frame->hw_frames_ctx = av_buffer_ref(avctx->hw_frames_ctx);
++        if (!frame->hw_frames_ctx) {
++            av_buffer_unref(&frame->buf[0]);
++            return AVERROR(ENOMEM);
++        }
++    }
++
+     frame->data[3] = frame->buf[0]->data;
++
++    if (!buffer->render) {
++        uint8_t *p = OH_AVBuffer_GetAddr(output->buffer);
++        if (!p) {
++            av_log(avctx, AV_LOG_ERROR, "Failed to get output buffer addr\n");
++            ret = AVERROR_EXTERNAL;
++            goto fail;
++        }
++
++        ret = av_image_fill_linesizes(linesize, sw_format, s->stride);
++        if (ret < 0)
++            goto fail;
++        ret = av_image_fill_pointers(data, sw_format, s->slice_height, p, linesize);
++        if (ret < 0)
++            goto fail;
++
++        for (int i = 0; i < AV_NUM_DATA_POINTERS; i++) {
++            frame->data[i] = data[i];
++            frame->linesize[i] = linesize[i];
++        }
++        frame->data[3] = frame->buf[0]->data;
++    }
++
+     frame->pts = av_rescale_q(attr->pts, AV_TIME_BASE_Q, avctx->pkt_timebase);
+     frame->pkt_dts = AV_NOPTS_VALUE;
+ 
+     return 0;
++
++fail:
++    av_buffer_unref(&frame->hw_frames_ctx);
++    av_buffer_unref(&frame->buf[0]);
++    return ret;
+ }
+ 
+ static int oh_decode_wrap_sw_buffer(AVCodecContext *avctx, AVFrame *frame,
+@@ -566,7 +790,7 @@ static int oh_decode_output_frame(AVCodecContext *avctx, AVFrame *frame,
+             return AVERROR_EXTERNAL;
+     }
+ 
+-    if (s->output_to_window)
++    if (s->output_hw_frame)
+         return oh_decode_wrap_hw_buffer(avctx, frame, output, &attr);
+     return oh_decode_wrap_sw_buffer(avctx, frame, output, &attr);
+ }
+@@ -696,6 +920,7 @@ static void oh_decode_flush(AVCodecContext *avctx)
+ {
+     OHCodecDecContext *s = avctx->priv_data;
+ 
++    oh_decode_invalidate_outputs(avctx);
+     OH_VideoDecoder_Flush(s->dec);
+ 
+     ff_mutex_lock(&s->input_mutex);
+diff --git a/libavutil/hwcontext_oh.c b/libavutil/hwcontext_oh.c
+index 6d1f27c..92cc046 100644
+--- a/libavutil/hwcontext_oh.c
++++ b/libavutil/hwcontext_oh.c
+@@ -19,6 +19,7 @@
+  */
+ 
+ #include <multimedia/player_framework/native_avcodec_base.h>
++#include <native_window/external_window.h>
+ 
+ #include "hwcontext.h"
+ #include "hwcontext_internal.h"
+@@ -35,11 +36,23 @@ static int oh_device_create(AVHWDeviceContext *ctx, const char *device,
+     return 0;
+ }
+ 
++static void oh_device_uninit(AVHWDeviceContext *ctx)
++{
++    AVOHCodecDeviceContext *hwctx = ctx->hwctx;
++
++    if (hwctx->native_window && hwctx->native_window_owned) {
++        OH_NativeWindow_DestroyNativeWindow(hwctx->native_window);
++        hwctx->native_window = NULL;
++        hwctx->native_window_owned = 0;
++    }
++}
++
+ const HWContextType ff_hwcontext_type_oh = {
+     .type = AV_HWDEVICE_TYPE_OHCODEC,
+     .name = "ohcodec",
+     .device_hwctx_size = sizeof(AVOHCodecDeviceContext),
+     .device_create = oh_device_create,
++    .device_uninit = oh_device_uninit,
+     .pix_fmts = (const enum AVPixelFormat[]) {
+         AV_PIX_FMT_OHCODEC,
+         AV_PIX_FMT_NONE
+diff --git a/libavutil/hwcontext_oh.h b/libavutil/hwcontext_oh.h
+index 2794f85..ba11182 100644
+--- a/libavutil/hwcontext_oh.h
++++ b/libavutil/hwcontext_oh.h
+@@ -21,6 +21,33 @@
+ #ifndef AVUTIL_HWCONTEXT_OH_H
+ #define AVUTIL_HWCONTEXT_OH_H
+ 
++#include <stdint.h>
++
++typedef enum AVOHCodecOutputMode {
++    AV_OHCODEC_OUTPUT_MODE_AUTO = 0,
++    AV_OHCODEC_OUTPUT_MODE_SURFACE,
++    AV_OHCODEC_OUTPUT_MODE_BUFFER,
++} AVOHCodecOutputMode;
++
++/**
++ * Metadata carried by AVFrame.data[3] / AVFrame.buf[0]->data for
++ * AV_PIX_FMT_OHCODEC frames produced in buffer output mode.
++ *
++ * The buffer field is an OH_AVBuffer* and remains valid until the backing
++ * AVBufferRef is released.
++ */
++typedef struct AVOHCodecFrameDescriptor {
++    void *buffer;
++    int index;
++    int width;
++    int height;
++    int stride;
++    int slice_height;
++    int pixel_format;
++    int native_buffer_format;
++    uint64_t generation;
++} AVOHCodecFrameDescriptor;
++
+ /**
+  * OpenHarmony codec device
+  */
+@@ -29,6 +56,23 @@ typedef struct AVOHCodecDeviceContext {
+      * Pointer to OHNativeWindow
+      */
+     void *native_window;
++
++    /**
++     * How the decoder should expose decoded frames.
++     */
++    int output_mode;
++
++    /**
++     * Whether native_window is owned by this device context and should be
++     * released when the context is destroyed.
++     */
++    int native_window_owned;
++
++    /**
++     * Incremented whenever decoder control flow invalidates outstanding
++     * buffer-mode outputs (for example flush/reset/stop).
++     */
++    uint64_t output_generation;
+ } AVOHCodecDeviceContext;
+ 
+ #endif /* AVUTIL_HWCONTEXT_OH_H */
