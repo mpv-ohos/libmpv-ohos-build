@@ -113,7 +113,10 @@ fi
 # libplacebo
 if [ ! -d libplacebo ]; then
   echo "Downloading libplacebo..."
-  git -c advice.detachedHead=false clone -q --depth 1 -b $V_LIBPLACEBO --recursive https://code.videolan.org/videolan/libplacebo.git libplacebo > /dev/null
+  git -c advice.detachedHead=false clone -q --recursive https://code.videolan.org/videolan/libplacebo.git libplacebo > /dev/null
+  cd libplacebo
+  git reset --hard $V_LIBPLACEBO
+  cd ..
 else
   echo "libplacebo already exists, skipping."
 fi
