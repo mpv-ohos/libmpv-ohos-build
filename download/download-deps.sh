@@ -97,7 +97,7 @@ fi
 # ffmpeg
 if [ ! -d ffmpeg ]; then
   echo "Downloading ffmpeg..."
-  git -c advice.detachedHead=false clone -q --depth 1 -b $V_FFMPEG https://github.com/FFmpeg/FFmpeg.git ffmpeg > /dev/null
+  git -c advice.detachedHead=false clone -q --depth 1 -b $V_FFMPEG https://code.ffmpeg.org/FFmpeg/FFmpeg.git ffmpeg > /dev/null
 else
   echo "ffmpeg already exists, skipping."
 fi
