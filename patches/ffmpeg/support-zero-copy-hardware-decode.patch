@@ -1,9 +1,9 @@
 diff --git a/libavcodec/Makefile b/libavcodec/Makefile
-index 95ba308..4ac7e61 100644
+index 796db2b..db569fa 100644
 --- a/libavcodec/Makefile
 +++ b/libavcodec/Makefile
-@@ -18,6 +18,7 @@ HEADERS = ac3_parser.h                                                  \
-           exif.h                                                        \
+@@ -17,6 +17,7 @@ HEADERS = ac3_parser.h                                                  \
+           dxva2.h                                                       \
            jni.h                                                         \
            mediacodec.h                                                  \
 +          ohcodec_buffer.h                                              \
@@ -43,7 +43,7 @@ index 0000000..a1d3d7d
 +
 +#endif /* AVCODEC_OHCODEC_BUFFER_H */
 diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
-index 943b027..a0fb70f 100644
+index cf1177a..f745b7d 100644
 --- a/libavcodec/ohdec.c
 +++ b/libavcodec/ohdec.c
 @@ -20,11 +20,17 @@
@@ -64,7 +64,7 @@ index 943b027..a0fb70f 100644
  #include "libavutil/hwcontext_oh.h"
  #include "libavutil/imgutils.h"
  #include "libavutil/mem.h"
-@@ -35,10 +41,33 @@
+@@ -34,8 +40,31 @@
  #include "avcodec.h"
  #include "codec_internal.h"
  #include "decode.h"
@@ -74,8 +74,7 @@ index 943b027..a0fb70f 100644
  #include "hwconfig.h"
  #include "ohcodec.h"
 +#include "ohcodec_buffer.h"
- #include "pthread_internal.h"
- 
++
 +#define OH_DOVI_QUEUE_SIZE 64
 +
 +typedef struct OHCodecDecQueueItem {
@@ -94,20 +93,10 @@ index 943b027..a0fb70f 100644
 +    OH_AVCodec *dec;
 +    atomic_uint_fast64_t generation;
 +} OHCodecDecRef;
-+
+ 
  typedef struct OHCodecDecContext {
      AVClass *avclass;
-     OH_AVCodec *dec;
-@@ -46,7 +75,7 @@ typedef struct OHCodecDecContext {
-      * dec. dec will be destroyed only after oh_decode_close and all hardware
-      * frames have been released.
-      */
--    OH_AVCodec **dec_ref;
-+    OHCodecDecRef *dec_ref;
- 
-     AVMutex input_mutex;
-     AVCond input_cond;
-@@ -58,8 +87,14 @@ typedef struct OHCodecDecContext {
+@@ -56,8 +85,14 @@ typedef struct OHCodecDecContext {
  
      AVPacket pkt;
  
@@ -122,7 +111,7 @@ index 943b027..a0fb70f 100644
  
      bool output_to_window;
      bool got_stream_info;
-@@ -68,6 +103,7 @@ typedef struct OHCodecDecContext {
+@@ -66,20 +101,142 @@ typedef struct OHCodecDecContext {
      int stride;
      int slice_height;
      OH_AVPixelFormat pix_fmt;
@@ -130,29 +119,33 @@ index 943b027..a0fb70f 100644
  
      char *name;
      int allow_sw;
-@@ -79,16 +115,148 @@ DEFINE_OFFSET_ARRAY(OHCodecDecContext, mutex_cond, mutex_cond_cnt,
-                     (OFFSET(input_mutex), OFFSET(output_mutex)),
-                     (OFFSET(input_cond), OFFSET(output_cond)));
+ } OHCodecDecContext;
  
 -typedef struct OHCodecBuffer {
 +struct AVOHCodecBuffer {
      uint32_t index;
 -    OH_AVBuffer *buffer;
--    OH_AVCodec **dec_ref;  ///< RefStruct reference
+     AVBufferRef *dec_ref;
 -} OHCodecBuffer;
-+    OHCodecDecRef *dec_ref;
 +    uint64_t generation;
 +    atomic_bool released;
 +};
 +
++static OHCodecDecRef *oh_decode_ref(const OHCodecDecContext *s)
++{
++    return (OHCodecDecRef *)s->dec_ref->data;
++}
++
 +static uint64_t oh_decode_generation(const OHCodecDecContext *s)
 +{
-+    return atomic_load_explicit(&s->dec_ref->generation, memory_order_acquire);
++    return atomic_load_explicit(&oh_decode_ref(s)->generation,
++                                memory_order_acquire);
 +}
 +
 +static void oh_decode_invalidate_outputs(OHCodecDecContext *s)
 +{
-+    atomic_fetch_add_explicit(&s->dec_ref->generation, 1, memory_order_acq_rel);
++    atomic_fetch_add_explicit(&oh_decode_ref(s)->generation, 1,
++                              memory_order_acq_rel);
 +}
 +
 +static void oh_decode_clear_dovi(OHCodecDecContext *s)
@@ -168,7 +161,7 @@ index 943b027..a0fb70f 100644
 +{
 +    OHCodecDecContext *s = avctx->priv_data;
 +    size_t sd_size;
-+    uint8_t *sd;
++    const uint8_t *sd;
 +    H2645NAL *rpu_nal = NULL;
 +    AVBufferRef *rpu = NULL, *metadata = NULL;
 +    AVDOVIMetadata *dovi = NULL;
@@ -176,19 +169,13 @@ index 943b027..a0fb70f 100644
 +
 +    if (avctx->codec_id != AV_CODEC_ID_HEVC || !pkt->size)
 +        return 0;
-+
 +    sd = av_packet_get_side_data(pkt, AV_PKT_DATA_DOVI_CONF, &sd_size);
 +    if (sd && sd_size >= sizeof(s->dovi_ctx.cfg))
 +        s->dovi_ctx.cfg = *(const AVDOVIDecoderConfigurationRecord *)sd;
-+
 +    ret = ff_h2645_packet_split(&s->dovi_pkt, pkt->data, pkt->size, avctx, 0,
 +                                AV_CODEC_ID_HEVC, H2645_FLAG_SMALL_PADDING);
-+    if (ret < 0) {
-+        av_log(avctx, AV_LOG_WARNING,
-+               "Failed to inspect HEVC packet for Dolby Vision RPU\n");
++    if (ret < 0)
 +        return 0;
-+    }
-+
 +    for (int i = s->dovi_pkt.nb_nals - 1; i >= 0; i--) {
 +        H2645NAL *nal = &s->dovi_pkt.nals[i];
 +        if (nal->type == HEVC_NAL_UNSPEC62 && nal->size > 2 &&
@@ -199,20 +186,16 @@ index 943b027..a0fb70f 100644
 +    }
 +    if (!rpu_nal)
 +        return 0;
-+
 +    rpu = av_buffer_alloc(rpu_nal->raw_size - 2);
 +    if (!rpu)
 +        return AVERROR(ENOMEM);
 +    memcpy(rpu->data, rpu_nal->raw_data + 2, rpu_nal->raw_size - 2);
-+
 +    ret = ff_dovi_rpu_parse(&s->dovi_ctx, rpu_nal->data + 2,
 +                            rpu_nal->size - 2, avctx->err_recognition);
 +    if (ret < 0) {
-+        av_log(avctx, AV_LOG_WARNING, "Error parsing Dolby Vision RPU\n");
 +        av_buffer_unref(&rpu);
 +        return 0;
 +    }
-+
 +    ret = ff_dovi_get_metadata(&s->dovi_ctx, &dovi);
 +    if (ret < 0) {
 +        av_buffer_unref(&rpu);
@@ -226,7 +209,6 @@ index 943b027..a0fb70f 100644
 +            return AVERROR(ENOMEM);
 +        }
 +    }
-+
 +    if (s->nb_dovi_frames == OH_DOVI_QUEUE_SIZE) {
 +        av_buffer_unref(&s->dovi_frames[0].rpu);
 +        av_buffer_unref(&s->dovi_frames[0].metadata);
@@ -237,8 +219,7 @@ index 943b027..a0fb70f 100644
 +    s->dovi_frames[s->nb_dovi_frames++] = (OHDoviFrame) {
 +        .pts = pkt->pts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE :
 +               av_rescale_q(pkt->pts, avctx->pkt_timebase, AV_TIME_BASE_Q),
-+        .rpu = rpu,
-+        .metadata = metadata,
++        .rpu = rpu, .metadata = metadata,
 +    };
 +    return 0;
 +}
@@ -247,27 +228,20 @@ index 943b027..a0fb70f 100644
 +                                 int64_t pts)
 +{
 +    int found = -1;
-+    for (int i = 0; i < s->nb_dovi_frames; i++) {
-+        if (s->dovi_frames[i].pts == pts) {
-+            found = i;
-+            break;
-+        }
-+    }
++    for (int i = 0; i < s->nb_dovi_frames; i++)
++        if (s->dovi_frames[i].pts == pts) { found = i; break; }
 +    if (found < 0)
 +        return 0;
-+
 +    OHDoviFrame dovi = s->dovi_frames[found];
 +    memmove(&s->dovi_frames[found], &s->dovi_frames[found + 1],
 +            sizeof(s->dovi_frames[0]) * (s->nb_dovi_frames - found - 1));
 +    s->nb_dovi_frames--;
-+
 +    if (dovi.rpu && !av_frame_new_side_data_from_buf(
 +            frame, AV_FRAME_DATA_DOVI_RPU_BUFFER, dovi.rpu)) {
 +        av_buffer_unref(&dovi.rpu);
 +        av_buffer_unref(&dovi.metadata);
 +        return AVERROR(ENOMEM);
 +    }
-+    dovi.rpu = NULL;
 +    if (dovi.metadata && !av_frame_new_side_data_from_buf(
 +            frame, AV_FRAME_DATA_DOVI_METADATA, dovi.metadata)) {
 +        av_buffer_unref(&dovi.metadata);
@@ -276,28 +250,29 @@ index 943b027..a0fb70f 100644
 +    return 0;
 +}
  
- static void oh_decode_release(AVRefStructOpaque unused, void *obj)
+ static void oh_decode_release(void *opaque, uint8_t *data)
  {
--    OH_AVCodec **decp = obj;
--    OH_AVErrCode err = OH_VideoDecoder_Destroy(*decp);
-+    OHCodecDecRef *ref = obj;
-+    OH_AVErrCode err = OH_VideoDecoder_Destroy(ref->dec);
+-    OH_AVCodec *dec = (OH_AVCodec *)data;
++    OHCodecDecRef *ref = (OHCodecDecRef *)data;
++    OH_AVCodec *dec = ref->dec;
+     OH_AVErrCode err = OH_VideoDecoder_Destroy(dec);
      if (err == AV_ERR_OK)
          av_log(NULL, AV_LOG_DEBUG, "Destroy decoder success\n");
-     else
-@@ -132,15 +300,47 @@ static int oh_decode_create(OHCodecDecContext *s, AVCodecContext *avctx)
- 
-     s->dec_ref = av_refstruct_alloc_ext(sizeof(*s->dec_ref), 0, NULL, oh_decode_release);
-     if (!s->dec_ref) {
--        oh_decode_release((AVRefStructOpaque){.nc = NULL }, &s->dec);
-+        OHCodecDecRef ref = { .dec = s->dec };
-+        oh_decode_release((AVRefStructOpaque){.nc = NULL }, &ref);
-         s->dec = NULL;
-         return AVERROR(ENOMEM);
+@@ -122,14 +279,47 @@ static int oh_decode_create(OHCodecDecContext *s, AVCodecContext *avctx)
      }
--    *s->dec_ref = s->dec;
-+    s->dec_ref->dec = s->dec;
-+    atomic_init(&s->dec_ref->generation, 0);
+     av_log(avctx, AV_LOG_DEBUG, "Create decoder %s success\n", name);
+ 
+-    s->dec_ref = av_buffer_create((uint8_t *)s->dec, 0, oh_decode_release,
+-                                  NULL, 0);
++    OHCodecDecRef *ref = av_mallocz(sizeof(*ref));
++    if (!ref)
++        return AVERROR(ENOMEM);
++    ref->dec = s->dec;
++    atomic_init(&ref->generation, 0);
++    s->dec_ref = av_buffer_create((uint8_t *)ref, sizeof(*ref),
++                                  oh_decode_release, NULL, 0);
+     if (!s->dec_ref)
+         return AVERROR(ENOMEM);
  
      return 0;
  }
@@ -316,11 +291,9 @@ index 943b027..a0fb70f 100644
 +            return 0;
 +        av_buffer_unref(&avctx->hw_frames_ctx);
 +    }
-+
 +    avctx->hw_frames_ctx = av_hwframe_ctx_alloc(avctx->hw_device_ctx);
 +    if (!avctx->hw_frames_ctx)
 +        return AVERROR(ENOMEM);
-+
 +    frames = (AVHWFramesContext *)avctx->hw_frames_ctx->data;
 +    frames->format = AV_PIX_FMT_OHCODEC;
 +    frames->sw_format = sw_format;
@@ -335,7 +308,7 @@ index 943b027..a0fb70f 100644
  static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx)
  {
      int ret;
-@@ -151,7 +351,12 @@ static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx)
+@@ -140,7 +330,12 @@ static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx)
          if (device_ctx->type == AV_HWDEVICE_TYPE_OHCODEC) {
              AVOHCodecDeviceContext *dev = device_ctx->hwctx;
              window = dev->native_window;
@@ -349,7 +322,7 @@ index 943b027..a0fb70f 100644
          } else {
              av_log(avctx, AV_LOG_WARNING, "Ignore invalid hw device type %s\n",
                     av_hwdevice_get_type_name(device_ctx->type));
-@@ -221,14 +426,11 @@ static void oh_decode_on_stream_changed(OH_AVCodec *codec, OH_AVFormat *format,
+@@ -210,14 +405,11 @@ static void oh_decode_on_stream_changed(OH_AVCodec *codec, OH_AVFormat *format,
  {
      AVCodecContext *avctx = userdata;
      OHCodecDecContext *s = avctx->priv_data;
@@ -366,7 +339,7 @@ index 943b027..a0fb70f 100644
          av_log(avctx, AV_LOG_ERROR, "Get dimension info from format failed\n");
          goto out;
      }
-@@ -236,29 +438,63 @@ static void oh_decode_on_stream_changed(OH_AVCodec *codec, OH_AVFormat *format,
+@@ -225,29 +417,63 @@ static void oh_decode_on_stream_changed(OH_AVCodec *codec, OH_AVFormat *format,
      if (ff_set_dimensions(avctx, s->width, s->height) < 0)
          goto out;
  
@@ -433,7 +406,7 @@ index 943b027..a0fb70f 100644
      } else {
          av_log(avctx, AV_LOG_ERROR, "Failed to get pixel format\n");
          goto out;
-@@ -300,8 +536,10 @@ static void oh_decode_on_need_input(OH_AVCodec *codec, uint32_t index,
+@@ -289,8 +515,10 @@ static void oh_decode_on_need_input(OH_AVCodec *codec, uint32_t index,
  {
      AVCodecContext *avctx = userdata;
      OHCodecDecContext *s = avctx->priv_data;
@@ -446,7 +419,7 @@ index 943b027..a0fb70f 100644
      };
  
      ff_mutex_lock(&s->input_mutex);
-@@ -319,8 +557,10 @@ static void oh_decode_on_output(OH_AVCodec *codec, uint32_t index,
+@@ -308,8 +536,10 @@ static void oh_decode_on_output(OH_AVCodec *codec, uint32_t index,
  {
      AVCodecContext *avctx = userdata;
      OHCodecDecContext *s = avctx->priv_data;
@@ -459,7 +432,7 @@ index 943b027..a0fb70f 100644
      };
  
      ff_mutex_lock(&s->output_mutex);
-@@ -358,8 +598,11 @@ static int oh_decode_start(OHCodecDecContext *s, AVCodecContext *avctx)
+@@ -347,8 +577,11 @@ static int oh_decode_start(OHCodecDecContext *s, AVCodecContext *avctx)
                 err, av_err2str(ret));
          return ret;
      }
@@ -471,7 +444,7 @@ index 943b027..a0fb70f 100644
          ret = ff_oh_err_to_ff_err(err);
          av_log(avctx, AV_LOG_ERROR, "Start failed, %d, %s\n",
                 err, av_err2str(ret));
-@@ -373,6 +616,16 @@ static av_cold int oh_decode_init(AVCodecContext *avctx)
+@@ -362,6 +595,18 @@ static av_cold int oh_decode_init(AVCodecContext *avctx)
  {
      OHCodecDecContext *s = avctx->priv_data;
  
@@ -479,16 +452,18 @@ index 943b027..a0fb70f 100644
 +    s->dovi_ctx.logctx = avctx;
 +    if (avctx->codec_id == AV_CODEC_ID_HEVC) {
 +        const AVPacketSideData *sd =
-+            ff_get_coded_side_data(avctx, AV_PKT_DATA_DOVI_CONF);
++            av_packet_side_data_get(avctx->coded_side_data,
++                                    avctx->nb_coded_side_data,
++                                    AV_PKT_DATA_DOVI_CONF);
 +        if (sd && sd->size >= sizeof(s->dovi_ctx.cfg))
 +            s->dovi_ctx.cfg =
 +                *(const AVDOVIDecoderConfigurationRecord *)sd->data;
 +    }
 +
      // Initialize these fields first, so oh_decode_close can destroy them safely
-     int ret = ff_pthread_init(s, mutex_cond_offsets);
-     if (ret < 0)
-@@ -386,9 +639,9 @@ static av_cold int oh_decode_init(AVCodecContext *avctx)
+     ff_mutex_init(&s->input_mutex, NULL);
+     ff_cond_init(&s->input_cond, NULL);
+@@ -376,9 +621,9 @@ static av_cold int oh_decode_init(AVCodecContext *avctx)
          return ret;
  
      size_t fifo_size = 16;
@@ -500,7 +475,7 @@ index 943b027..a0fb70f 100644
                                       AV_FIFO_FLAG_AUTO_GROW);
      if (!s->input_queue || !s->output_queue)
          return AVERROR(ENOMEM);
-@@ -405,6 +658,9 @@ static av_cold int oh_decode_close(AVCodecContext *avctx)
+@@ -395,6 +640,9 @@ static av_cold int oh_decode_close(AVCodecContext *avctx)
      OHCodecDecContext *s = avctx->priv_data;
  
      if (s->dec) {
@@ -510,7 +485,7 @@ index 943b027..a0fb70f 100644
          /* Stop but don't destroy dec directly, to keep hardware frames on
           * the fly valid.
           */
-@@ -419,6 +675,9 @@ static av_cold int oh_decode_close(AVCodecContext *avctx)
+@@ -409,6 +657,9 @@ static av_cold int oh_decode_close(AVCodecContext *avctx)
      }
  
      av_packet_unref(&s->pkt);
@@ -518,48 +493,45 @@ index 943b027..a0fb70f 100644
 +    ff_h2645_packet_uninit(&s->dovi_pkt);
 +    ff_dovi_ctx_unref(&s->dovi_ctx);
  
-     av_fifo_freep2(&s->input_queue);
- 
-@@ -429,29 +688,45 @@ static av_cold int oh_decode_close(AVCodecContext *avctx)
+     ff_mutex_destroy(&s->input_mutex);
+     ff_cond_destroy(&s->input_cond);
+@@ -421,34 +672,36 @@ static av_cold int oh_decode_close(AVCodecContext *avctx)
      return 0;
  }
  
+-static void oh_buffer_release(void *opaque, uint8_t *data)
 +int av_ohcodec_release_buffer(AVOHCodecBuffer *buffer, int render)
-+{
-+    OH_AVErrCode err;
-+
-+    if (!buffer)
-+        return AVERROR(EINVAL);
-+    if (atomic_exchange_explicit(&buffer->released, true,
-+                                 memory_order_acq_rel))
-+        return render ? AVERROR(EALREADY) : 0;
-+
-+    if (buffer->generation != atomic_load_explicit(
-+            &buffer->dec_ref->generation, memory_order_acquire))
-+        return render ? AVERROR(ESTALE) : 0;
-+
-+    if (render)
-+        err = OH_VideoDecoder_RenderOutputBuffer(buffer->dec_ref->dec,
-+                                                  buffer->index);
-+    else
-+        err = OH_VideoDecoder_FreeOutputBuffer(buffer->dec_ref->dec,
-+                                                buffer->index);
-+
-+    return ff_oh_err_to_ff_err(err);
-+}
-+
- static void oh_buffer_release(void *opaque, uint8_t *data)
  {
 -    if (!opaque)
+-        return;
+-
+-    OHCodecBuffer *buffer = opaque;
++    OHCodecDecRef *ref;
++    OH_AVErrCode err;
++    if (!buffer)
++        return AVERROR(EINVAL);
++    if (atomic_exchange_explicit(&buffer->released, true, memory_order_acq_rel))
++        return render ? AVERROR(EALREADY) : 0;
++    ref = (OHCodecDecRef *)buffer->dec_ref->data;
++    if (buffer->generation != atomic_load_explicit(&ref->generation,
++                                                    memory_order_acquire))
++        return render ? AVERROR(ESTALE) : 0;
++    err = render ? OH_VideoDecoder_RenderOutputBuffer(ref->dec, buffer->index)
++                 : OH_VideoDecoder_FreeOutputBuffer(ref->dec, buffer->index);
++    return ff_oh_err_to_ff_err(err);
++}
+ 
+-    if (!buffer->dec_ref) {
+-        av_free(buffer);
++static void oh_buffer_release(void *opaque, uint8_t *data)
++{
 +    AVOHCodecBuffer *buffer = opaque;
-+
 +    if (!buffer)
          return;
- 
--    OHCodecBuffer *buffer = opaque;
+-    }
 -
 -    if (buffer->buffer) {
--        OH_AVCodec *dec = *buffer->dec_ref;
+-        OH_AVCodec *dec = (OH_AVCodec *)buffer->dec_ref->data;
 -        OH_AVCodecBufferAttr attr;
 -        OH_AVErrCode err = OH_AVBuffer_GetBufferAttr(buffer->buffer, &attr);
 -        if (err == AV_ERR_OK && !(attr.flags & AVCODEC_BUFFER_FLAGS_DISCARD))
@@ -569,7 +541,7 @@ index 943b027..a0fb70f 100644
 -    }
 +    av_ohcodec_release_buffer(buffer, 0);
  
-     av_refstruct_unref(&buffer->dec_ref);
+     av_buffer_unref(&buffer->dec_ref);
      av_free(buffer);
  }
  
@@ -579,7 +551,7 @@ index 943b027..a0fb70f 100644
                                      const OH_AVCodecBufferAttr *attr)
  {
      OHCodecDecContext *s = avctx->priv_data;
-@@ -463,31 +738,40 @@ static int oh_decode_wrap_hw_buffer(AVCodecContext *avctx, AVFrame *frame,
+@@ -460,7 +713,7 @@ static int oh_decode_wrap_hw_buffer(AVCodecContext *avctx, AVFrame *frame,
          return ret;
  
      frame->format = AV_PIX_FMT_OHCODEC;
@@ -588,19 +560,14 @@ index 943b027..a0fb70f 100644
      if (!buffer)
          return AVERROR(ENOMEM);
  
--    buffer->dec_ref = av_refstruct_ref(s->dec_ref);
--
+@@ -471,24 +724,28 @@ static int oh_decode_wrap_hw_buffer(AVCodecContext *avctx, AVFrame *frame,
+     }
+ 
      buffer->index = output->index;
 -    buffer->buffer = output->buffer;
 -    frame->buf[0] = av_buffer_create((uint8_t *)buffer->buffer, 1,
 +    buffer->generation = output->generation;
 +    atomic_init(&buffer->released, false);
-+    buffer->dec_ref = av_refstruct_ref(s->dec_ref);
-+    if (!buffer->dec_ref) {
-+        OH_VideoDecoder_FreeOutputBuffer(s->dec, output->index);
-+        av_free(buffer);
-+        return AVERROR(ENOMEM);
-+    }
 +    frame->buf[0] = av_buffer_create((uint8_t *)buffer, 1,
                                       oh_buffer_release,
                                       buffer, AV_BUFFER_FLAG_READONLY);
@@ -612,7 +579,6 @@ index 943b027..a0fb70f 100644
 +    frame->hw_frames_ctx = av_buffer_ref(avctx->hw_frames_ctx);
 +    if (!frame->hw_frames_ctx)
 +        return AVERROR(ENOMEM);
-+
 +    // Opaque AVOHCodecBuffer token, never an addressable image plane.
      frame->data[3] = frame->buf[0]->data;
      frame->pts = av_rescale_q(attr->pts, AV_TIME_BASE_Q, avctx->pkt_timebase);
@@ -628,7 +594,7 @@ index 943b027..a0fb70f 100644
                                      const OH_AVCodecBufferAttr *attr)
  {
      OHCodecDecContext *s = avctx->priv_data;
-@@ -533,7 +817,7 @@ static int oh_decode_wrap_sw_buffer(AVCodecContext *avctx, AVFrame *frame,
+@@ -534,7 +791,7 @@ static int oh_decode_wrap_sw_buffer(AVCodecContext *avctx, AVFrame *frame,
  }
  
  static int oh_decode_output_frame(AVCodecContext *avctx, AVFrame *frame,
@@ -637,7 +603,7 @@ index 943b027..a0fb70f 100644
  {
      OHCodecDecContext *s = avctx->priv_data;
      OH_AVCodecBufferAttr attr;
-@@ -570,7 +854,8 @@ static int oh_decode_output_frame(AVCodecContext *avctx, AVFrame *frame,
+@@ -571,7 +828,8 @@ static int oh_decode_output_frame(AVCodecContext *avctx, AVFrame *frame,
      return oh_decode_wrap_sw_buffer(avctx, frame, output, &attr);
  }
  
@@ -647,7 +613,7 @@ index 943b027..a0fb70f 100644
  {
      OHCodecDecContext *s = avctx->priv_data;
      OH_AVErrCode err;
-@@ -633,12 +918,25 @@ static int oh_decode_send_pkt(AVCodecContext *avctx, OHBufferQueueItem *input)
+@@ -634,12 +892,25 @@ static int oh_decode_send_pkt(AVCodecContext *avctx, OHBufferQueueItem *input)
      return 0;
  }
  
@@ -674,7 +640,7 @@ index 943b027..a0fb70f 100644
          int ret;
  
          // Try get output
-@@ -647,8 +945,11 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+@@ -648,8 +919,11 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
              if (av_fifo_read(s->output_queue, &buffer, 1) >= 0)
                  break;
              // Only wait after send EOF
@@ -688,7 +654,7 @@ index 943b027..a0fb70f 100644
              else
                  break;
          }
-@@ -657,8 +958,11 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+@@ -658,8 +932,11 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
          ff_mutex_unlock(&s->output_mutex);
  
          // Got a frame
@@ -701,7 +667,7 @@ index 943b027..a0fb70f 100644
          if (ret < 0)
              return ret;
  
-@@ -667,6 +971,8 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+@@ -668,6 +945,8 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
              ret = ff_decode_get_packet(avctx, &s->pkt);
              if (ret < 0 && ret != AVERROR_EOF)
                  return ret;
@@ -710,7 +676,7 @@ index 943b027..a0fb70f 100644
          }
  
          // Wait input buffer
-@@ -674,7 +980,9 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+@@ -675,7 +954,9 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
          while (!s->decode_status) {
              if (av_fifo_read(s->input_queue, &buffer, 1) >= 0)
                  break;
@@ -721,7 +687,7 @@ index 943b027..a0fb70f 100644
          }
  
          ret = s->decode_status;
-@@ -683,6 +991,12 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+@@ -684,6 +965,12 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
          if (ret < 0)
              return ret;
  
@@ -734,7 +700,7 @@ index 943b027..a0fb70f 100644
          ret = oh_decode_send_pkt(avctx, &buffer);
          if (ret < 0)
              return ret;
-@@ -695,6 +1009,9 @@ static void oh_decode_flush(AVCodecContext *avctx)
+@@ -696,6 +983,9 @@ static void oh_decode_flush(AVCodecContext *avctx)
  {
      OHCodecDecContext *s = avctx->priv_data;
  
@@ -744,7 +710,7 @@ index 943b027..a0fb70f 100644
      OH_VideoDecoder_Flush(s->dec);
  
      ff_mutex_lock(&s->input_mutex);
-@@ -703,10 +1020,16 @@ static void oh_decode_flush(AVCodecContext *avctx)
+@@ -704,10 +994,16 @@ static void oh_decode_flush(AVCodecContext *avctx)
      av_fifo_reset2(s->output_queue);
      s->decode_status = 0;
      s->eof_sent = false;
