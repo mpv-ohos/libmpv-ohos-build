@@ -11,16 +11,13 @@ pushd $ROOT_DIR/libmpv/ffmpeg
 if [ "$1" == "build" ]; then
 	echo -e "\nBuilding FFmpeg..."
 elif [ "$1" == "clean" ]; then
-	rm -rf .build
+	make distclean
 	exit 0
 else
 	exit 1
 fi
 
-mkdir -p .build
-cd .build
-
-../configure \
+./configure \
   --prefix=$DEST \
   --arch=aarch64 \
   --cpu=armv8-a \
